@@ -74,6 +74,7 @@ DEFAULT_SETTINGS = {
         'Kneading': {'t_start': 312.0, 't_end': 354.0, 'view_min': 250.0, 'view_max': 400.0, 'ptfe': 1.0},
     },
     'sg_window': 15, 'sg_poly': 3,
+    't_step': 0.05,         # 분석 온도 간격 (°C) — 데이터를 이 간격으로 평균 (0 = 원본 그대로)
     'peak_min': 250.0, 'peak_max': 400.0,
     'onset_width': 5.0,
     'endo': '아래 (흡열 = 최솟값)',
@@ -522,8 +523,10 @@ def ingest_file(name, data, S):
 # =====================================================================
 # 분석 알고리즘
 # =====================================================================
-def clean_xy(df, tcol, hcol, heating_only=True):
-    """두 컬럼을 숫자로 변환하고 둘 다 NaN이 아닌 행만 사용"""
+def clean_xy(df, tcol, hcol, heating_only=True, step=0.05):
+    """두 컬럼을 숫자로 변환하고 둘 다 NaN이 아닌 행만 사용.
+    step > 0 이면 온도를 step(°C) 간격 구간으로 평균 → 내보내기 형식(소수점 자리수)과 측정 간격에 관계없이
+    같은 데이터가 같은 결과를 내도록 한다. 구간 경계(…025, …075)가 소수 둘째 자리 값과 겹치지 않게 0.05 °C 권장."""
     t = pd.to_numeric(df[tcol], errors='coerce')
     h = pd.to_numeric(df[hcol], errors='coerce')
     m = t.notna() & h.notna()
@@ -534,7 +537,8 @@ def clean_xy(df, tcol, hcol, heating_only=True):
         imax = int(np.argmax(temp))            # 최고 온도 이후(냉각 구간)는 제외 → 1st Heating만 사용
         temp, hf = temp[:imax + 1], hf[:imax + 1]
     if len(temp):
-        g = pd.DataFrame({'t': temp, 'h': hf}).groupby('t', as_index=False).mean()   # 정렬 + 등온 중복 제거
+        key = np.floor(temp / step + 0.5) if step and step > 0 else temp
+        g = pd.DataFrame({'k': key, 't': temp, 'h': hf}).groupby('k', as_index=False)[['t', 'h']].mean()   # 정렬 + 중복 제거 + 균일 간격
         temp, hf = g['t'].to_numpy(), g['h'].to_numpy()
     return temp, hf, n_valid
 
@@ -632,7 +636,7 @@ def blank_curve(bid, version, tcol, hcol, unit, heating_only):
     df = load_df(bid, version)
     if df.empty or tcol not in df.columns or hcol not in df.columns:
         return None
-    t, h, _ = clean_xy(df, tcol, hcol, heating_only)
+    t, h, _ = clean_xy(df, tcol, hcol, heating_only, 0.05)
     return t, h * (1000.0 if unit == 'W' else 1.0)
 
 
@@ -647,7 +651,7 @@ def analyze_sample(sid, version, pjson):
     if p['tcol'] not in df.columns or p['hcol'] not in df.columns:
         out['error'] = '선택한 컬럼이 데이터에 없습니다.'
         return out
-    temp, hf, n_valid = clean_xy(df, p['tcol'], p['hcol'], p['heating_only'])
+    temp, hf, n_valid = clean_xy(df, p['tcol'], p['hcol'], p['heating_only'], p.get('t_step', 0.05))
     out['n_valid'] = n_valid
     if len(temp):
         out['t_range'] = (float(temp.min()), float(temp.max()))
@@ -680,7 +684,7 @@ def sample_params(row, S, blank_info):
              t_start=float(row['t_start']), t_end=float(row['t_end']), ptfe=float(row['ptfe']),
              dh0=float(S['dh0']), rate=float(S['rate']), sg_window=int(S['sg_window']), sg_poly=int(S['sg_poly']),
              peak_min=float(S['peak_min']), peak_max=float(S['peak_max']), onset_width=float(S['onset_width']),
-             endo=S['endo'], heating_only=bool(S['heating_only']), min_points=int(S['min_points']), proc=proc,
+             endo=S['endo'], heating_only=bool(S['heating_only']), t_step=float(S.get('t_step', 0.05)), min_points=int(S['min_points']), proc=proc,
              blank=blank_info if (row['hf_unit'] in ('mW', 'W')) else None)
     return json.dumps(p, sort_keys=True, ensure_ascii=False)
 
@@ -1374,7 +1378,8 @@ def render_sample_report(S, samples, res, cur_row):
     # 0. 진단 정보
     if r.get('t_range'):
         st.info(f'진단 정보: 읽어온 온도 범위 {r["t_range"][0]:.1f} ~ {r["t_range"][1]:.1f} °C, 유효 데이터 {r["n_valid"]:,}행'
-                + (f' (1st Heating {len(r["temp"]):,}점 사용)' if r.get('temp') is not None and S['heating_only'] else ''))
+                + (f' → {"1st Heating, " if S["heating_only"] else ""}{float(S.get("t_step", 0.05)):g} °C 간격 평균 {len(r["temp"]):,}점으로 분석'
+                   if r.get('temp') is not None else ''))
 
     # 컬럼 선택
     cols = list(df.columns)
@@ -1770,6 +1775,12 @@ def render_sop(S, samples):
         onw = c.number_input('Onset 베이스라인 평균 폭 (°C)', value=float(S['onset_width']), step=1.0, min_value=0.5,
                              help='(적분 시작 온도 − 폭) ~ 적분 시작 온도 구간의 평균을 베이스라인 y값으로 사용')
         a, b, c = st.columns(3)
+        tstep = a.number_input('분석 온도 간격 (°C)', value=float(S.get('t_step', 0.05)), step=0.01, min_value=0.0, format='%.2f',
+                               help='데이터를 이 온도 간격으로 평균한 뒤 분석합니다. 내보내기 형식(Full/간소화)이나 '
+                                    '소수점 자리수가 달라도 같은 결과가 나오게 합니다. 기본 0.05 °C (0 = 원본 그대로)')
+        b.caption(f'스무딩 폭 ≈ window × 간격 = {int(S["sg_window"])} × {float(S.get("t_step", 0.05)):.2f} = '
+                  f'{int(S["sg_window"]) * float(S.get("t_step", 0.05)):.2f} °C')
+        a, b, c = st.columns(3)
         pmin = a.number_input('피크 탐색 구간 시작 (°C)', value=float(S['peak_min']), step=5.0)
         pmax = b.number_input('피크 탐색 구간 종료 (°C)', value=float(S['peak_max']), step=5.0)
         hs = c.number_input('헤더 탐색 시작 행 (엑셀 기준)', value=int(S['header_start_row']), step=1, min_value=1)
@@ -1807,7 +1818,7 @@ def render_sop(S, samples):
         else:
             for p in PROCESSES:
                 S['proc'][p].update(vals[p])
-            S.update(dh0=dh0, rate=rate, endo=endo, sg_window=int(sgw) | 1, sg_poly=int(sgp), onset_width=onw,
+            S.update(dh0=dh0, rate=rate, endo=endo, sg_window=int(sgw) | 1, sg_poly=int(sgp), onset_width=onw, t_step=float(tstep),
                      peak_min=pmin, peak_max=pmax, header_start_row=int(hs), deriv_ylim_mode=dym, deriv_ylim=dyl,
                      heating_only=heat, use_blank=use_blank, active_blank=act_b, cv_warn=cvw,
                      name_batch_mul=int(bm), name_feed_mul=int(fm), name_temp_mul=int(tm))
@@ -1891,6 +1902,8 @@ DSC는 시료를 일정 속도로 가열하며 드나드는 열량을 측정합�
 
 **0. 헤더 자동 탐지** — 엑셀 **{S['header_start_row']}행 이후**에서 온도(`temp`/`온도`)와 열흐름(`heat`/`flow`/`hf`/`열`) 키워드가 함께 있는
 첫 행을 헤더로, 바로 다음 행을 **단위 행**으로 인식합니다. 완전히 빈 행은 제거하고, 온도·Heat Flow가 모두 숫자인 행만 사용합니다.
+
+**0-1. 균일 간격 평균** — 데이터를 **{S.get('t_step', 0.05):g} °C 간격**으로 평균합니다. TRIOS 간소화 내보내기는 온도를 소수 둘째 자리(0.01 °C)로 반올림해서 점 간격이 0.01/0.02 °C로 들쭉날쭉해지는데, 이대로 미분하면 기울기가 흔들려 **T_onset이 Full 내보내기와 약 1 °C 달라집니다**. 평균 후에는 두 형식의 결과가 같아집니다 (T_peak·X_c는 원래도 거의 같음).
 """)
     st.markdown('**1. 스무딩 & 미분** — Savitzky-Golay 필터(window 15, 3차)로 노이즈를 줄이고 1차 미분을 구합니다.')
     st.markdown('**2. 용융 피크 (T_peak)** — 피크 탐색 구간(기본 250~400 °C)에서 스무딩된 Heat Flow가 가장 낮은 점(흡열 피크)')
