@@ -346,7 +346,7 @@ def _meta_from_rows(raw, upto):
             continue
         key = str(row[0]).strip()
         rest = ' '.join(str(v).strip() for v in row[1:] if pd.notna(v) and str(v).strip())
-        if meta['mass_mg'] is None and re.search(r'sample\s*mass|^mass$|^weight$|sample\s*weight|시료\s*(질량|무게)|^질량', key, re.I):
+        if meta['mass_mg'] is None and re.search(r'sample\s*mass|^mass$|^size$|^sample\s*size$|^weight$|sample\s*weight|시료\s*(질량|무게)|^질량', key, re.I):
             m = re.search(r'(-?[\d.,]+)\s*(mg|g)?', rest, re.I)
             if m:
                 v = _num(m.group(1))
@@ -421,18 +421,34 @@ def default_columns(cols):
 
 def hf_unit_of(col, units):
     u = (units.get(col) or (re.search(r'\(([^)]*)\)\s*$', col).group(1) if re.search(r'\(([^)]*)\)\s*$', col) else '')).lower().replace(' ', '')
-    c = col.lower()
-    if '/mg' in u:
-        return 'W/g'
-    if u in ('w/g',) or 'normaliz' in c:
-        return 'W/g'
-    if u == 'mw/g':
-        return 'mW/g'
-    if u == 'mw':
-        return 'mW'
-    if u == 'w':
-        return 'W'
+    # 단위 행(또는 괄호 속 단위)을 먼저 본다 — 'Heat Flow (Normalized)'라도 단위가 mW/g이면 mW/g
+    table = {'mw/mg': 'W/g', 'w/g': 'W/g', 'mw/g': 'mW/g', 'uw/mg': 'mW/g', 'mw': 'mW', 'w': 'W'}
+    u = u.replace('µ', 'u').replace('μ', 'u')
+    if u in table:
+        return table[u]
     return 'W/g'
+
+
+def _hf_columns(cols):
+    low = [c.lower() for c in cols]
+    return [cols[i] for i, c in enumerate(low)
+            if any(k in c for k in HF_KW) and not any(x in c for x in ('deriv', 'rev', 'phase', 'temp', 'capacity'))]
+
+
+def infer_mass_mg(df, units):
+    """같은 파일에 mW(절대값)와 정규화(mW/g, W/g) Heat Flow가 함께 있으면 둘의 비로 시료 질량(mg)을 구한다."""
+    hcols = _hf_columns(list(df.columns))
+    abs_c = next((c for c in hcols if hf_unit_of(c, units) in ('mW', 'W')), None)
+    nrm_c = next((c for c in hcols if hf_unit_of(c, units) in ('mW/g', 'W/g')), None)
+    if not abs_c or not nrm_c:
+        return None
+    a = pd.to_numeric(df[abs_c], errors='coerce').to_numpy(float) * (1000.0 if hf_unit_of(abs_c, units) == 'W' else 1.0)
+    b = pd.to_numeric(df[nrm_c], errors='coerce').to_numpy(float) / (1000.0 if hf_unit_of(nrm_c, units) == 'mW/g' else 1.0)
+    ok = np.isfinite(a) & np.isfinite(b) & (np.abs(b) > 1e-9)
+    if ok.sum() < 10:
+        return None
+    m = float(np.median(a[ok] / b[ok]))          # mW ÷ (W/g) = mg
+    return m if m > 0 else None
 
 
 def ingest_file(name, data, S):
@@ -448,6 +464,16 @@ def ingest_file(name, data, S):
     ti, hi = default_columns(cols)
     tcol, hcol = cols[ti], cols[hi]
     unit = hf_unit_of(hcol, units)
+    if not p['meta']['mass_mg']:
+        m = infer_mass_mg(df, units)
+        if m:
+            p['meta']['mass_mg'] = round(m, 4)
+            p['meta']['mass_inferred'] = True
+    if unit in ('mW', 'W') and not p['meta']['mass_mg']:
+        # 질량을 모르면 정규화(W/g, mW/g) Heat Flow 열이 있을 때 그 열을 사용
+        nrm = next((c for c in _hf_columns(cols) if hf_unit_of(c, units) in ('mW/g', 'W/g')), None)
+        if nrm:
+            hcol, unit = nrm, hf_unit_of(nrm, units)
     info = parse_filename(name, S)
     is_blank = 1 if BLANK_RE.search(name) or BLANK_RE.search(p['meta'].get('sample_name') or '') else 0
     buf = io.BytesIO()
@@ -1084,13 +1110,93 @@ def apply_editor(orig, edited, mapping, S):
     return changed
 
 
+@st.dialog('🗑️ 데이터 삭제 확인')
+def delete_dialog(ids):
+    rows = get_conn().execute(f"SELECT filename FROM samples WHERE id IN ({','.join('?' * len(ids))})",
+                              [int(i) for i in ids]).fetchall()
+    st.write(f'다음 **{len(rows)}개** Raw 데이터와 분석 결과를 삭제합니다.')
+    st.markdown('\n'.join(f'- {r[0]}' for r in rows[:15]) + (f'\n- … 외 {len(rows) - 15}개' if len(rows) > 15 else ''))
+    st.caption('삭제 직후 화면 위쪽의 [↩️ 되돌리기] 버튼으로 복구할 수 있습니다.')
+    c1, c2 = st.columns(2)
+    if c1.button('삭제', type='primary', width='stretch', key='dlg_del'):
+        st.session_state['_undo'] = db_fetch_full(ids)
+        db_delete(ids)
+        for k in ('ed_all', 'ed_lot', 'ed_dash', 'ed_dsamp'):
+            bump(k)
+        st.session_state['_sb_sig'] = None
+        st.rerun()
+    if c2.button('취소', width='stretch', key='dlg_cancel'):
+        st.rerun()
+
+
+def render_undo():
+    undo = st.session_state.get('_undo')
+    if not undo:
+        return
+    u1, u2, u3 = st.columns([5, 1, 1])
+    names = ', '.join(r['filename'] for r in undo[:3]) + (f' 외 {len(undo) - 3}개' if len(undo) > 3 else '')
+    u1.info(f'🗑️ {len(undo)}개 데이터를 삭제했습니다: {names}')
+    if u2.button('↩️ 되돌리기', width='stretch', key='undo_btn'):
+        db_restore(undo)
+        st.session_state.pop('_undo')
+        for k in ('ed_all', 'ed_lot', 'ed_dash', 'ed_dsamp'):
+            bump(k)
+        st.session_state['_sb_sig'] = None
+        st.rerun()
+    if u3.button('닫기', width='stretch', key='undo_close'):
+        st.session_state.pop('_undo')
+        st.rerun()
+
+
+def migrate_units(S, samples):
+    """v8.0에서 'Heat Flow (Normalized)' mW/g 열을 W/g로 잘못 저장한 데이터 바로잡기 (1회)"""
+    if S.get('migr_unit_v2') or samples.empty:
+        if not S.get('migr_unit_v2'):
+            S['migr_unit_v2'] = True
+            save_settings(S)
+        return False
+    changed = False
+    for sid, row in samples.iterrows():
+        units = json.loads(row['meta'] or '{}').get('units', {})
+        new = hf_unit_of(row['hf_col'], units)
+        upd = {}
+        if row['hf_unit'] == 'W/g' and new != 'W/g':
+            upd['hf_unit'] = new
+        if new in ('mW', 'W') and pd.isna(row['mass']):
+            m = infer_mass_mg(load_df(int(sid), int(row['version'])), units)
+            if m:
+                upd['mass'] = round(m, 4)
+        if upd:
+            db_update(int(sid), **upd)
+            changed = True
+    S['migr_unit_v2'] = True
+    save_settings(S)
+    return changed
+
+
+SIDEBAR_CSS = """
+<style>
+/* 사이드바를 넓혀 긴 파일명이 잘리지 않게 */
+section[data-testid="stSidebar"] { width: 440px !important; min-width: 440px !important; }
+section[data-testid="stSidebar"] > div:first-child { width: 440px !important; }
+/* 드롭다운 목록: 펼친 목록을 오른쪽으로 넓혀 긴 파일명을 끝까지 표시 */
+[data-testid="stSelectboxVirtualDropdown"] { min-width: min(860px, 92vw) !important; }
+[data-testid="stSelectboxVirtualDropdown"] [role="option"] > div { overflow: visible !important; text-overflow: clip !important; }
+div[data-baseweb="popover"] li div { overflow: visible !important; text-overflow: clip !important; }
+</style>
+"""
+
+
 # =====================================================================
 # 메인 화면
 # =====================================================================
 def main():
     st.set_page_config(page_title='건식전극 PTFE 결정화도 자동 분석기', layout='wide', page_icon='🧪')
+    st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
     S = load_settings()
     samples = db_samples()
+    if migrate_units(S, samples):
+        samples = db_samples()
     res = build_results(samples, S)
 
     # ---------------- 사이드바 ----------------
@@ -1113,6 +1219,7 @@ def main():
                 st.session_state['cur_sid'] = ids[0]
             st.selectbox('시료 선택', ids, key='cur_sid',
                          format_func=lambda i: res.at[i, '파일명'] if i in res.index else str(i))
+            st.caption(f"📄 {res.at[st.session_state['cur_sid'], '파일명']}")
             st_now = res.at[st.session_state['cur_sid'], '상태']
             if st_now != '정상':
                 st.caption(f'⚠️ 상태: {st_now} — {res.at[st.session_state["cur_sid"], "메시지"]}')
@@ -1169,6 +1276,7 @@ def main():
     if '_flash' in st.session_state:
         kind, msg = st.session_state.pop('_flash')
         getattr(st, kind)(msg)
+    render_undo()
 
     tab_an, tab_dash, tab_sop, tab_help = st.tabs(['📊 데이터 분석', '📈 대시보드', '⚙️ SOP 설정', '📖 분석 원리 / 사용법'])
 
@@ -1217,6 +1325,19 @@ def render_upload(S):
                 st.session_state.pop('upload_msgs')
                 st.rerun()
 
+    allrows = db_samples()
+    if not allrows.empty:
+        allrows = allrows.sort_values('uploaded_at', ascending=False)
+        with st.expander(f'🗂️ 업로드된 Raw 데이터 ({len(allrows)}개) — 목록 보기 · 삭제'):
+            names = {int(i): f'{r["filename"]}{"  (Blank)" if r["is_blank"] else ""}  ·  {r["uploaded_at"]}' for i, r in allrows.iterrows()}
+            pick = st.multiselect('삭제할 파일 선택 (입력해서 검색 가능)', list(names), format_func=lambda i: names[i],
+                                  key=f'up_del_{st.session_state.get("ed_all", 0)}', placeholder='파일을 선택하세요')
+            d1, d2, _ = st.columns([1.3, 1.3, 4])
+            if d1.button(f'🗑️ 선택 삭제 ({len(pick)}개)', disabled=not pick, width='stretch', key='up_del_btn'):
+                delete_dialog(pick)
+            if d2.button('🗑️ 전체 삭제', width='stretch', key='up_del_all'):
+                delete_dialog(list(names))
+
 
 def render_sample_report(S, samples, res, cur_row):
     if cur_row is None:
@@ -1229,7 +1350,7 @@ def render_sample_report(S, samples, res, cur_row):
     r = analyze_sample(sid, int(cur_row['version']), sample_params(cur_row, S, binfo))
     info = parse_filename(cur_row['filename'], S)
 
-    h1, h2, h3 = st.columns([6, 1, 1])
+    h1, h2, h3, h4 = st.columns([6, 1, 1, 1])
     with h1:
         st.markdown(f'#### {cur_row["filename"]}')
         chips = [f'로트 **{cur_row["lot"]}**', f'시료 {rep_label(int(cur_row["rep"]))}', f'공정 **{cur_row["proc"]}**']
@@ -1241,6 +1362,8 @@ def render_sample_report(S, samples, res, cur_row):
         st.caption(' · '.join(chips))
     h2.button('◀ 이전', on_click=cb_nav, args=(-1,), width='stretch', key='nav_prev')
     h3.button('다음 ▶', on_click=cb_nav, args=(1,), width='stretch', key='nav_next')
+    if h4.button('🗑️ 삭제', width='stretch', key='rep_del', help='이 시료의 Raw 데이터를 삭제합니다'):
+        delete_dialog([sid])
 
     hr = cur_row['header_row']
     if pd.notna(hr):
@@ -1331,6 +1454,8 @@ def render_lot_view(S, samples, res):
         new_ptfe = c2.number_input('PTFE 함량 (wt%)', value=float(g['PTFE'].iloc[0]), step=0.1, min_value=0.0, key=f'lw_{k}')
         new_memo = c3.text_input('메모', value=S['lot_memo'].get(lot, ''), key=f'lm_{k}')
         c4.write('')
+        if st.button(f'🗑️ 이 로트의 Raw 데이터 모두 삭제 ({len(g)}개)', key=f'ld_{k}'):
+            delete_dialog([int(i) for i in g.index])
         if c4.button('적용', key=f'la_{k}', type='primary', width='stretch'):
             if new_proc != cur_proc:
                 d_ = S['proc'][new_proc]
@@ -1417,32 +1542,10 @@ def render_data_manager(S, samples, res):
         to_del = [int(i) for i in edited.index[edited['삭제']]]
         c1, c2, c3 = st.columns([1.3, 1.3, 4])
         if c1.button(f'🗑️ 선택 삭제 ({len(to_del)}개)', disabled=not to_del, width='stretch'):
-            st.session_state['_confirm_del'] = to_del
+            delete_dialog(to_del)
         csv = res.drop(columns=['id', 'ok']).to_csv(index=False).encode('utf-8-sig')
         c2.download_button('📥 전체 결과 CSV', csv, file_name=f'DSC_PTFE_results_{datetime.now():%Y%m%d}.csv',
                            mime='text/csv', on_click='ignore', width='stretch')
-        pend = st.session_state.get('_confirm_del')
-        if pend:
-            st.warning(f'{len(pend)}개 시료를 삭제합니다. 계속할까요? (삭제 직후 되돌리기 가능)')
-            k1, k2, _ = st.columns([1, 1, 5])
-            if k1.button('삭제 확인', type='primary', width='stretch'):
-                st.session_state['_undo'] = db_fetch_full(pend)
-                db_delete(pend)
-                st.session_state.pop('_confirm_del')
-                bump('ed_all')
-                st.rerun()
-            if k2.button('취소', width='stretch'):
-                st.session_state.pop('_confirm_del')
-                st.rerun()
-    undo = st.session_state.get('_undo')
-    if undo:
-        u1, u2 = st.columns([4, 1])
-        u1.info(f'{len(undo)}개 데이터를 삭제했습니다.')
-        if u2.button('↩️ 되돌리기', width='stretch'):
-            db_restore(undo)
-            st.session_state.pop('_undo')
-            bump('ed_all')
-            st.rerun()
 
     # Blank
     blanks = samples[samples['is_blank'] == 1]
@@ -1456,9 +1559,7 @@ def render_data_manager(S, samples, res):
             act = (S.get('active_blank') == int(bid)) or (S.get('active_blank') not in blanks.index and bid == blanks.sort_values('uploaded_at').index[-1])
             c1.write(f'{"✅ " if act and S["use_blank"] else ""}{b["filename"]} · 단위 {b["hf_unit"]} · 업로드 {b["uploaded_at"]}')
             if c2.button('삭제', key=f'bdel_{bid}', width='stretch'):
-                st.session_state['_undo'] = db_fetch_full([int(bid)])
-                db_delete([int(bid)])
-                st.rerun()
+                delete_dialog([int(bid)])
 
     with st.expander('💽 데이터 백업'):
         st.write(f'모든 데이터는 `{DB_PATH}` 파일에 저장됩니다. 이 파일을 복사해 두면 백업이 되고, '
@@ -1803,7 +1904,7 @@ DSC는 시료를 일정 속도로 가열하며 드나드는 열량을 측정합�
     st.latex(r'X_c\ (\%) = \frac{\Delta H_m}{w_{PTFE} \times \Delta H_0} \times 100')
     st.caption('예) ΔHm = 0.47 J/g, PTFE 1 wt%, ΔH₀ = 85.4 J/g → 0.47 / (0.01 × 85.4) × 100 = 55.0 %')
     st.markdown("""
-**Heat Flow 단위** — 엑셀이 W/g(정규화)이면 그대로 사용합니다. mW로 내보낸 파일은 시료 질량(mg)으로 나눠 W/g로 바꾸며,
+**Heat Flow 단위** — 파일의 단위 행을 읽어 W/g로 맞춥니다 (W/g 그대로, mW/g ÷ 1000). mW로 내보낸 파일은 시료 질량(mg)으로 나눠 W/g로 바꾸며,
 이때 Blank(빈 팬) 파일이 있으면 먼저 빼 줍니다.
 
 #### 5. 상태 표시 의미
@@ -1817,7 +1918,13 @@ DSC는 시료를 일정 속도로 가열하며 드나드는 열량을 측정합�
 - **결정화도가 100%를 넘거나 너무 낮아요.** → PTFE 함량(wt%), ΔH₀, Heat Flow 단위(W/g인지 mW인지)를 확인하세요.
 - **“'Temperature'와 'Heat Flow' 항목 행을 찾지 못했습니다” 오류** → 내보낼 때 Temperature와 Heat Flow 신호가 포함되게 하세요.
 - **같은 파일을 다시 올리면?** → 같은 파일명은 새 데이터로 교체되고, 공정·PTFE·적분 구간 등 설정은 유지됩니다.
-- **잘못 지웠어요.** → 삭제 직후 나타나는 **↩️ 되돌리기** 버튼으로 복구할 수 있습니다.
+- **필요 없는 Raw 데이터는 어디서 지우나요?** → ① 업로드 칸 바로 아래 **🗂️ 업로드된 Raw 데이터** 목록에서 선택 삭제 / 전체 삭제,
+  ② 샘플별 분석 화면 오른쪽 위 **🗑️ 삭제**(지금 보고 있는 시료), ③ 로트별 분석의 **로트 Raw 데이터 모두 삭제**,
+  ④ 전체 데이터 관리 표의 **삭제** 체크 후 선택 삭제. 모두 확인 창이 뜹니다.
+- **잘못 지웠어요.** → 삭제 직후 화면 위쪽에 나타나는 **↩️ 되돌리기** 버튼으로 복구할 수 있습니다.
+- **전체(Full) 내보내기와 간소화 내보내기 결과가 같나요?** → 네. 단위 행(mW, mW/g, W/g)을 읽어 자동 환산합니다.
+  Full 파일에 질량 정보가 없어도 `Heat Flow`(mW)와 `Heat Flow (Normalized)`(mW/g)의 비로 질량을 계산합니다.
+  단, Blank 차감은 mW 단위 데이터에만 적용되므로 Blank를 쓰면 두 형식의 값이 조금 다를 수 있습니다.
 - **데이터는 어디에 저장되나요?** → `app.py` 옆의 `dsc_ptfe_data.db` 파일입니다. 이 파일을 복사해 두면 백업이 됩니다.
 - **그래프 이미지 복사가 안 돼요.** → 브라우저가 막는 경우입니다. 그래프를 우클릭 → *이미지 복사* 또는 **PNG 저장**을 이용하세요.
 """)
