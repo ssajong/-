@@ -355,6 +355,7 @@ def _meta_from_rows(raw, upto):
                     v *= 1000
                 if v > 0:
                     meta['mass_mg'] = float(v)
+                    meta['mass_key'] = key
         if not meta['sample_name'] and re.search(r'^sample\s*name|^시료\s*(명|이름)', key, re.I):
             meta['sample_name'] = rest
         if not meta['run_date'] and re.search(r'run\s*date|^date$|측정\s*일', key, re.I):
@@ -1042,7 +1043,12 @@ def cb_global():
     S = load_settings()
     S['dh0'] = float(st.session_state['sb_dh0'])
     S['rate'] = float(st.session_state['sb_rate'])
+    S['use_blank'] = bool(st.session_state['sb_blank'])
     save_settings(S)
+
+
+def cb_use_ratio_mass(m):
+    db_update(st.session_state.get('cur_sid'), mass=round(float(m), 4))
 
 
 def cb_sop_range():
@@ -1242,9 +1248,9 @@ def main():
             for k, v in vals.items():
                 st.session_state[f'sb_{k}'] = v
             st.session_state['_sb_sig'] = sig
-        gsig = (float(S['dh0']), float(S['rate']))
+        gsig = (float(S['dh0']), float(S['rate']), bool(S['use_blank']))
         if st.session_state.get('_sb_gsig') != gsig:
-            st.session_state['sb_dh0'], st.session_state['sb_rate'] = gsig
+            st.session_state['sb_dh0'], st.session_state['sb_rate'], st.session_state['sb_blank'] = gsig
             st.session_state['_sb_gsig'] = gsig
         no_sample = cur_row is None
 
@@ -1270,6 +1276,8 @@ def main():
                   help='선택 시료의 적분 구간을 SOP 설정값으로 되돌립니다.')
         c2.button('로트 적용', on_click=cb_apply_lot, disabled=no_sample, width='stretch',
                   help='공정·PTFE·적분 구간을 같은 로트의 모든 시료에 적용합니다.')
+        st.checkbox('Blank(빈 팬) 차감 사용', key='sb_blank', on_change=cb_global,
+                    help='Blank는 mW 단위 데이터에만 적용됩니다. 정규화(mW/g, W/g) 데이터에는 적용되지 않습니다.')
         st.caption('💾 모든 값은 변경 즉시 자동 저장됩니다.')
 
     # ---------------- 본문 ----------------
@@ -1399,8 +1407,27 @@ def render_sample_report(S, samples, res, cur_row):
     c4.number_input('시료 질량 (mg)', min_value=0.0, step=0.01, key='rep_mass', on_change=cb_mass,
                     disabled=st.session_state['rep_unit'] not in ('mW', 'W'),
                     help='Heat Flow 단위가 mW 또는 W일 때만 사용')
+    meta = json.loads(cur_row['meta'] or '{}')
+    units = meta.get('units', {})
+    unit_now = cur_row['hf_unit'] or 'W/g'
+    ratio_mass = infer_mass_mg(df, units)
+    mass_now = float(cur_row['mass']) if pd.notna(cur_row['mass']) else None
+    if unit_now in ('mW', 'W'):
+        src = ('mW 열 ÷ 정규화 열 비율로 계산' if meta.get('mass_inferred')
+               else f"파일 헤더 '{meta['mass_key']}' 항목" if meta.get('mass_key') else '파일 헤더 또는 직접 입력')
+        st.caption(f'⚖️ 사용 질량: **{mass_now if mass_now else "-"} mg** ({src})'
+                   + (f' · TRIOS 정규화 기준 질량 {ratio_mass:.4f} mg' if ratio_mass else ''))
+        if ratio_mass and mass_now and abs(mass_now - ratio_mass) / ratio_mass > 0.005:
+            w1, w2 = st.columns([5, 1.4])
+            w1.warning(f'사용 질량 {mass_now:g} mg이 TRIOS가 정규화에 쓴 질량 {ratio_mass:.4f} mg과 '
+                       f'{(mass_now / ratio_mass - 1) * 100:+.1f}% 다릅니다. 결정화도도 그만큼 달라집니다.')
+            w2.button(f'{ratio_mass:.4f} mg 적용', on_click=cb_use_ratio_mass, args=(ratio_mass,), width='stretch', key='use_ratio')
     if r.get('blank_applied'):
-        st.caption(f'🧪 Blank 차감 적용: {binfo["name"]}')
+        st.warning(f'🧪 Blank 차감 적용됨: **{binfo["name"]}** — Blank는 mW 단위 데이터에만 적용되므로, 같은 시료를 '
+                   '정규화(mW/g) 형식으로 내보낸 파일과 결정화도·온도가 다르게 나올 수 있습니다. '
+                   '두 형식을 비교하려면 사이드바의 **Blank 차감 사용**을 끄세요.')
+    elif S['use_blank'] and binfo and unit_now not in ('mW', 'W'):
+        st.caption(f'🧪 Blank 차감 미적용: 정규화({unit_now}) 데이터에는 Blank를 뺄 수 없습니다 (질량 정보 필요).')
 
     if r.get('error'):
         st.error(r['error'])
@@ -1419,6 +1446,28 @@ def render_sample_report(S, samples, res, cur_row):
 
     fig = make_report_fig(r, S, cur_row['proc'], cur_row['filename'])
     show_figure(fig, f'DSC_{cur_row["filename"].rsplit(".", 1)[0]}', key=f'rep_{sid}')
+
+    with st.expander('🩺 진단 정보 (결과가 이상할 때 이 내용을 복사해 문의하세요 — Raw 데이터 전체를 보낼 필요 없음)'):
+        hcols = _hf_columns(cols)
+        sample_rows = df[[cur_row['temp_col'], cur_row['hf_col']]].dropna().iloc[::max(1, len(df) // 5)].head(5)
+        diag = [
+            f'프로그램 버전: {APP_VERSION}',
+            f'파일명: {cur_row["filename"]}',
+            f'헤더 행: {int(hr) + 1 if pd.notna(hr) else "-"} / 단위 행: {int(cur_row["unit_row"]) + 1 if pd.notna(cur_row["unit_row"]) else "없음"}',
+            f'전체 컬럼({len(cols)}): {", ".join(cols)}',
+            f'Heat Flow 후보 열과 단위: ' + ', '.join(f'{c} [{units.get(c, "?")} → {hf_unit_of(c, units)}]' for c in hcols),
+            f'사용 열: 온도={cur_row["temp_col"]} / Heat Flow={cur_row["hf_col"]} / 단위={unit_now}',
+            f'사용 질량: {mass_now} mg / 헤더 질량 항목: {meta.get("mass_key", "-")} / 비율 계산 질량: {f"{ratio_mass:.4f}" if ratio_mass else "-"} mg',
+            f'Blank 차감: {"적용 - " + binfo["name"] if r.get("blank_applied") else "미적용"} (설정 {"ON" if S["use_blank"] else "OFF"})',
+            f'설정: 공정={cur_row["proc"]}, 적분 {r["t_start"]:.1f}~{r["t_end"]:.1f} °C, PTFE {float(cur_row["ptfe"]):g} wt%, '
+            f'ΔH0 {S["dh0"]} J/g, β {S["rate"]} °C/min, 온도간격 {S.get("t_step", 0.05)} °C, SG {S["sg_window"]}/{S["sg_poly"]}, '
+            f'1st Heating만={S["heating_only"]}, 흡열방향={S["endo"]}',
+            f'데이터: 유효 {r["n_valid"]}행 → 분석 {len(r["temp"])}점, 온도 {r["t_range"][0]:.2f}~{r["t_range"][1]:.2f} °C',
+            f'결과: T_onset {r["t_onset"]:.3f} / T_peak {r["t_peak"]:.3f} / 면적 {r["area"]:.6f} W/g·°C / '
+            f'ΔHm {r["dh"]:.5f} J/g / Xc {r["xc"]:.3f} %',
+            '데이터 예시(온도, Heat Flow): ' + ' | '.join(f'{a:g}, {b:g}' for a, b in sample_rows.itertuples(index=False)),
+        ]
+        st.code('\n'.join(diag), language=None)
 
 
 def render_lot_view(S, samples, res):
